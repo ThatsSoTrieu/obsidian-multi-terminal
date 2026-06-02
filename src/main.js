@@ -197,6 +197,8 @@ class TerminalPane {
     this.proc        = null;
     this.ro          = null;
     this.titleEl     = null;
+    this._dataSub    = null;
+    this._resizeSub  = null;
     this._build();
   }
 
@@ -243,6 +245,16 @@ class TerminalPane {
     });
 
     this.term.open(this.containerEl);
+
+    // Input/resize handlers live on the persistent term object, so they must be
+    // registered exactly once. Registering them inside _spawn() would stack a new
+    // copy on every restart() and duplicate every keystroke. They read this.proc
+    // lazily, so they always target the current process.
+    this._dataSub = this.term.onData(data => {
+      if (this.proc?.stdin?.writable) this.proc.stdin.write(data);
+    });
+    this._resizeSub = this.term.onResize(({ cols, rows }) => this._sendResize(cols, rows));
+
     this._spawn();
 
     let ready = false;
@@ -262,7 +274,7 @@ class TerminalPane {
 
   _spawn() {
     const shell = this.plugin.settings.shell || '/bin/sh';
-    this.proc = spawn('python3', [this.plugin.proxyPath, shell], {
+    const proc = spawn('python3', [this.plugin.proxyPath, shell], {
       stdio: ['pipe', 'pipe', 'pipe', 'pipe'],
       cwd: this.cwd,
       env: {
@@ -273,11 +285,16 @@ class TerminalPane {
         LINES:     String(this.term?.rows ?? 24),
       },
     });
+    this.proc = proc;
 
-    this.proc.stdout.on('data', chunk => this.term?.write(chunk));
-    this.proc.stdin.on('error', () => {});
+    // All proc handlers guard on `this.proc === proc` so that events from an
+    // already-replaced process (e.g. the old proc's async 'exit' after restart())
+    // can't write stale output into, or null out, the current process.
+    proc.stdout.on('data', chunk => { if (this.proc === proc) this.term?.write(chunk); });
+    proc.stdin.on('error', () => {});
 
-    this.proc.on('error', err => {
+    proc.on('error', err => {
+      if (this.proc !== proc) return;
       this.proc = null;
       this.term?.write(`\r\n\x1b[31m[error: ${err.message}]\x1b[0m\r\n`);
       if (err.code === 'ENOENT') {
@@ -285,13 +302,8 @@ class TerminalPane {
       }
     });
 
-    this.term.onData(data => {
-      if (this.proc?.stdin?.writable) this.proc.stdin.write(data);
-    });
-
-    this.term.onResize(({ cols, rows }) => this._sendResize(cols, rows));
-
-    this.proc.on('exit', code => {
+    proc.on('exit', code => {
+      if (this.proc !== proc) return;
       this.proc = null;
       this.term?.write(`\r\n\x1b[2m[exited ${code ?? 0}]\x1b[0m\r\n`);
     });
@@ -311,8 +323,8 @@ class TerminalPane {
     } catch {}
   }
 
-  applyTheme() {
-    if (this.term) this.term.options.theme = getObsidianTheme();
+  applyTheme(theme) {
+    if (this.term) this.term.options.theme = theme || getObsidianTheme();
   }
 
   applyFontSize(size) {
@@ -329,6 +341,8 @@ class TerminalPane {
 
   dispose() {
     this.ro?.disconnect();
+    this._dataSub?.dispose();
+    this._resizeSub?.dispose();
     try { this.proc?.kill('SIGKILL'); } catch {}
     this.proc = null;
     this.term?.dispose();
@@ -414,6 +428,16 @@ class MultiTerminalView extends ItemView {
     const gEl = e.currentTarget;
     gEl.classList.add('mt-active');
 
+    // Coalesce the relayout/fit work to one pass per animation frame — mousemove
+    // can fire far faster than the screen refreshes, and each _fit() forces a
+    // measure/reflow across every pane.
+    let rafId = null;
+    const relayout = () => {
+      rafId = null;
+      this._applyTemplate();
+      for (const { pane } of this.paneList) pane._fit();
+    };
+
     const onMove = ev => {
       const delta    = (isCol ? ev.clientX : ev.clientY) - startMouse;
       const combined = startPx[gutterIdx] + startPx[gutterIdx + 1];
@@ -424,11 +448,12 @@ class MultiTerminalView extends ItemView {
       newFrs[gutterIdx + 1] = combined - a;
       if (isCol) this.colFrs = newFrs;
       else       this.rowFrs = newFrs;
-      this._applyTemplate();
-      for (const { pane } of this.paneList) pane._fit();
+      if (rafId === null) rafId = requestAnimationFrame(relayout);
     };
 
     const onUp = () => {
+      if (rafId !== null) { cancelAnimationFrame(rafId); rafId = null; }
+      relayout();   // settle on the final size
       gEl.classList.remove('mt-active');
       document.removeEventListener('mousemove', onMove);
       document.removeEventListener('mouseup', onUp);
@@ -530,7 +555,8 @@ class MultiTerminalView extends ItemView {
 
     this.registerEvent(
       this.app.workspace.on('css-change', () => {
-        for (const { pane } of this.paneList) pane.applyTheme();
+        const theme = getObsidianTheme();   // resolve once, not per pane
+        for (const { pane } of this.paneList) pane.applyTheme(theme);
       })
     );
   }
