@@ -13,27 +13,68 @@ const { FitAddon }        = require('@xterm/addon-fit');
 
 // ─── Python PTY proxy ─────────────────────────────────────────────────────────
 
-const PTY_PROXY_PY = `import sys, os
-from selectors import DefaultSelector, EVENT_READ
-from struct import pack
+const PTY_PROXY_PY = `import sys, os, time, signal, ctypes
 
 CHUNK = 4096
+PR_SET_PDEATHSIG = 1
+
+def set_pdeathsig(sig):
+    # Ask the kernel to send us 'sig' when our parent dies (Linux only).
+    try:
+        ctypes.CDLL('libc.so.6', use_errno=True).prctl(PR_SET_PDEATHSIG, sig, 0, 0, 0)
+    except Exception:
+        pass
 
 def write_all(fd, data):
     while data:
         data = data[os.write(fd, data):]
 
+def reap(pid):
+    # Terminate the shell and wait for it, escalating to SIGKILL if needed.
+    try: os.kill(pid, signal.SIGTERM)
+    except OSError: return
+    deadline = time.time() + 1.0
+    while time.time() < deadline:
+        try:
+            if os.waitpid(pid, os.WNOHANG)[0]:
+                return
+        except OSError:
+            return
+        time.sleep(0.02)
+    try: os.kill(pid, signal.SIGKILL)
+    except OSError: pass
+    try: os.waitpid(pid, 0)
+    except OSError: pass
+
 def main():
     if sys.platform == 'win32':
         sys.exit(1)
+    from selectors import DefaultSelector, EVENT_READ
+    from struct import pack
     from pty import fork
     from fcntl import ioctl
     from termios import TIOCSWINSZ
 
+    # If Obsidian (our parent) dies, have the kernel signal us so we don't orphan.
+    set_pdeathsig(signal.SIGTERM)
+
     shell = sys.argv[1] if len(sys.argv) > 1 else (os.environ.get('SHELL') or '/bin/sh')
     pid, pty_fd = fork()
     if pid == 0:
-        os.execvp(shell, [shell])
+        # Child: die if the proxy dies, then become the shell.
+        set_pdeathsig(signal.SIGTERM)
+        try:
+            os.execvp(shell, [shell])
+        except Exception:
+            os._exit(127)
+
+    def shutdown(*_):
+        reap(pid)
+        os._exit(0)
+
+    # SIGTERM (incl. from pdeathsig) / SIGHUP -> clean up the shell and exit.
+    signal.signal(signal.SIGTERM, shutdown)
+    signal.signal(signal.SIGHUP, shutdown)
 
     with DefaultSelector() as sel:
         done = False
@@ -44,7 +85,7 @@ def main():
                 data = os.read(pty_fd, CHUNK)
             except OSError:
                 data = b''
-            if not data:
+            if not data:           # shell exited
                 done = True
                 try: sel.unregister(pty_fd)
                 except: pass
@@ -52,21 +93,33 @@ def main():
             write_all(1, data)
 
         def on_stdin():
+            nonlocal done
             try:
                 data = os.read(0, CHUNK)
-                if data:
-                    write_all(pty_fd, data)
-            except: pass
+            except OSError:
+                data = b''
+            if not data:           # stdin EOF == parent went away; stop, don't spin
+                done = True
+                try: sel.unregister(0)
+                except: pass
+                return
+            try: write_all(pty_fd, data)
+            except OSError: pass
 
         def on_cmd():
             try:
-                raw = os.read(3, 256).decode('utf-8', 'ignore')
-                for line in raw.splitlines():
-                    try:
-                        rows, cols = (int(x.strip()) for x in line.split('x', 1))
-                        ioctl(pty_fd, TIOCSWINSZ, pack('HHHH', rows, cols, 0, 0))
-                    except: pass
-            except: pass
+                raw = os.read(3, 256)
+            except OSError:
+                raw = b''
+            if not raw:            # resize pipe closed; stop watching it, don't spin
+                try: sel.unregister(3)
+                except: pass
+                return
+            for line in raw.decode('utf-8', 'ignore').splitlines():
+                try:
+                    rows, cols = (int(x.strip()) for x in line.split('x', 1))
+                    ioctl(pty_fd, TIOCSWINSZ, pack('HHHH', rows, cols, 0, 0))
+                except: pass
 
         sel.register(pty_fd, EVENT_READ, on_pty)
         sel.register(0,      EVENT_READ, on_stdin)
@@ -78,10 +131,13 @@ def main():
             try:
                 for key, _ in sel.select(timeout=1.0):
                     key.data()
-            except: break
+            except InterruptedError:
+                continue
+            except OSError:
+                break
 
-    try: os.waitpid(pid, 0)
-    except: pass
+    # Loop ended (shell exited or parent went away): make sure the shell is gone.
+    reap(pid)
 
 main()
 `;
