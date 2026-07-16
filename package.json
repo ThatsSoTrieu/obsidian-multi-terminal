@@ -1,11 +1,12 @@
 {
   "name": "obsidian-multi-terminal",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Open up to 6 terminals in one Obsidian window with a resizable, reorderable grid layout. Linux and macOS only.",
   "main": "main.js",
   "scripts": {
     "dev": "node esbuild.config.mjs",
-    "build": "node esbuild.config.mjs production"
+    "build": "node esbuild.config.mjs production",
+    "test": "node --check src/main.js && node tests/smoke.js"
   },
   "keywords": [],
   "author": "ThatsSoTrieu",

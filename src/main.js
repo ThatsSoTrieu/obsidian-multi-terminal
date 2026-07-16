@@ -1,15 +1,13 @@
 'use strict';
 
 const {
-  Plugin, ItemView, Notice, setIcon,
+  Plugin, ItemView, setIcon,
   PluginSettingTab, Setting, FileSystemAdapter,
 } = require('obsidian');
-const { spawn }           = require('child_process');
-const { writeFileSync }   = require('fs');
-const { join }            = require('path');
-const { tmpdir, homedir } = require('os');
-const { Terminal }        = require('@xterm/xterm');
-const { FitAddon }        = require('@xterm/addon-fit');
+const { spawn }    = require('child_process');
+const { homedir }  = require('os');
+const { Terminal } = require('@xterm/xterm');
+const { FitAddon } = require('@xterm/addon-fit');
 
 // ─── Python PTY proxy ─────────────────────────────────────────────────────────
 
@@ -27,28 +25,56 @@ def set_pdeathsig(sig):
 
 def write_all(fd, data):
     while data:
-        data = data[os.write(fd, data):]
+        written = os.write(fd, data)
+        if written <= 0:
+            return
+        data = data[written:]
 
-def reap(pid):
-    # Terminate the shell and wait for it, escalating to SIGKILL if needed.
-    try: os.kill(pid, signal.SIGTERM)
-    except OSError: return
+def exit_code(status):
+    if os.WIFEXITED(status):
+        return os.WEXITSTATUS(status)
+    if os.WIFSIGNALED(status):
+        return 128 + os.WTERMSIG(status)
+    return 0
+
+def signal_session(pid, pty_fd, sig):
+    # The shell and its foreground job may be in different process groups.
+    groups = {pid}
+    try:
+        foreground = os.tcgetpgrp(pty_fd)
+        if foreground > 0:
+            groups.add(foreground)
+    except OSError:
+        pass
+    for pgid in groups:
+        try: os.killpg(pgid, sig)
+        except OSError: pass
+
+def reap(pid, pty_fd, terminate=False):
+    # Hang up the PTY and wait for the shell, escalating if it does not exit.
+    if terminate:
+        signal_session(pid, pty_fd, signal.SIGTERM)
+    try: os.close(pty_fd)
+    except OSError: pass
     deadline = time.time() + 1.0
     while time.time() < deadline:
         try:
-            if os.waitpid(pid, os.WNOHANG)[0]:
-                return
+            waited, status = os.waitpid(pid, os.WNOHANG)
+            if waited:
+                return exit_code(status)
         except OSError:
-            return
+            return 0
         time.sleep(0.02)
-    try: os.kill(pid, signal.SIGKILL)
-    except OSError: pass
-    try: os.waitpid(pid, 0)
-    except OSError: pass
+    signal_session(pid, pty_fd, signal.SIGKILL)
+    try:
+        _, status = os.waitpid(pid, 0)
+        return exit_code(status)
+    except OSError:
+        return 0
 
 def main():
     if sys.platform == 'win32':
-        sys.exit(1)
+        return 1
     from selectors import DefaultSelector, EVENT_READ
     from struct import pack
     from pty import fork
@@ -56,20 +82,26 @@ def main():
     from termios import TIOCSWINSZ
 
     # If Obsidian (our parent) dies, have the kernel signal us so we don't orphan.
+    parent_pid = os.getppid()
     set_pdeathsig(signal.SIGTERM)
+    if os.getppid() != parent_pid:
+        return 1
 
     shell = sys.argv[1] if len(sys.argv) > 1 else (os.environ.get('SHELL') or '/bin/sh')
     pid, pty_fd = fork()
     if pid == 0:
         # Child: die if the proxy dies, then become the shell.
+        proxy_pid = os.getppid()
         set_pdeathsig(signal.SIGTERM)
+        if os.getppid() != proxy_pid:
+            os._exit(1)
         try:
             os.execvp(shell, [shell])
         except Exception:
             os._exit(127)
 
     def shutdown(*_):
-        reap(pid)
+        reap(pid, pty_fd, terminate=True)
         os._exit(0)
 
     # SIGTERM (incl. from pdeathsig) / SIGHUP -> clean up the shell and exit.
@@ -78,15 +110,18 @@ def main():
 
     with DefaultSelector() as sel:
         done = False
+        shell_exited = False
+        resize_buffer = b''
 
         def on_pty():
-            nonlocal done
+            nonlocal done, shell_exited
             try:
                 data = os.read(pty_fd, CHUNK)
             except OSError:
                 data = b''
             if not data:           # shell exited
                 done = True
+                shell_exited = True
                 try: sel.unregister(pty_fd)
                 except: pass
                 return
@@ -107,6 +142,7 @@ def main():
             except OSError: pass
 
         def on_cmd():
+            nonlocal resize_buffer
             try:
                 raw = os.read(3, 256)
             except OSError:
@@ -115,11 +151,15 @@ def main():
                 try: sel.unregister(3)
                 except: pass
                 return
-            for line in raw.decode('utf-8', 'ignore').splitlines():
+            resize_buffer += raw
+            while b'\n' in resize_buffer:
+                line, resize_buffer = resize_buffer.split(b'\n', 1)
                 try:
-                    rows, cols = (int(x.strip()) for x in line.split('x', 1))
+                    rows, cols = (int(x.strip()) for x in line.decode('ascii').split('x', 1))
                     ioctl(pty_fd, TIOCSWINSZ, pack('HHHH', rows, cols, 0, 0))
-                except: pass
+                except (ValueError, OSError): pass
+            if len(resize_buffer) > 1024:
+                resize_buffer = b''
 
         sel.register(pty_fd, EVENT_READ, on_pty)
         sel.register(0,      EVENT_READ, on_stdin)
@@ -136,22 +176,38 @@ def main():
             except OSError:
                 break
 
-    # Loop ended (shell exited or parent went away): make sure the shell is gone.
-    reap(pid)
+    # Preserve the shell's real exit status; otherwise terminate its PTY session.
+    return reap(pid, pty_fd, terminate=not shell_exited)
 
-main()
+sys.exit(main())
 `;
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 const VIEW_TYPE        = 'multi-terminal-view';
 const DEFAULT_SETTINGS = { count: 4, shell: '/bin/sh', fontSize: 12 };
+const FONT_SIZES       = [8, 10, 11, 12, 13, 14, 16, 18, 20, 24];
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 function debounce(fn, ms) {
   let t;
   return (...args) => { clearTimeout(t); t = setTimeout(() => fn(...args), ms); };
+}
+
+function normalizeSettings(data) {
+  const raw = data && typeof data === 'object' ? data : {};
+  const count = Number(raw.count);
+  const fontSize = Number(raw.fontSize);
+  return {
+    count: Number.isFinite(count)
+      ? Math.max(1, Math.min(6, Math.trunc(count)))
+      : DEFAULT_SETTINGS.count,
+    shell: typeof raw.shell === 'string' && raw.shell.trim()
+      ? raw.shell.trim()
+      : DEFAULT_SETTINGS.shell,
+    fontSize: FONT_SIZES.includes(fontSize) ? fontSize : DEFAULT_SETTINGS.fontSize,
+  };
 }
 
 // ─── Obsidian-aware xterm theme ───────────────────────────────────────────────
@@ -187,8 +243,9 @@ function getObsidianTheme() {
 // ─── TerminalPane ─────────────────────────────────────────────────────────────
 
 class TerminalPane {
-  constructor(containerEl, cwd, plugin, onNavigate) {
+  constructor(containerEl, titleEl, cwd, plugin, onNavigate) {
     this.containerEl = containerEl;
+    this.titleEl     = titleEl;
     this.cwd         = cwd;
     this.plugin      = plugin;
     this.onNavigate  = onNavigate;
@@ -196,7 +253,6 @@ class TerminalPane {
     this.fit         = null;
     this.proc        = null;
     this.ro          = null;
-    this.titleEl     = null;
     this._dataSub    = null;
     this._resizeSub  = null;
     this._build();
@@ -274,7 +330,7 @@ class TerminalPane {
 
   _spawn() {
     const shell = this.plugin.settings.shell || '/bin/sh';
-    const proc = spawn('python3', [this.plugin.proxyPath, shell], {
+    const proc = spawn('python3', ['-c', PTY_PROXY_PY, shell], {
       stdio: ['pipe', 'pipe', 'pipe', 'pipe'],
       cwd: this.cwd,
       env: {
@@ -291,6 +347,7 @@ class TerminalPane {
     // already-replaced process (e.g. the old proc's async 'exit' after restart())
     // can't write stale output into, or null out, the current process.
     proc.stdout.on('data', chunk => { if (this.proc === proc) this.term?.write(chunk); });
+    proc.stderr.on('data', chunk => { if (this.proc === proc) this.term?.write(chunk); });
     proc.stdin.on('error', () => {});
 
     proc.on('error', err => {
@@ -307,6 +364,18 @@ class TerminalPane {
       this.proc = null;
       this.term?.write(`\r\n\x1b[2m[exited ${code ?? 0}]\x1b[0m\r\n`);
     });
+  }
+
+  _terminateProcess(proc) {
+    if (!proc || proc.exitCode !== null || proc.signalCode !== null) return;
+    try { proc.kill('SIGTERM'); } catch {}
+    const timer = setTimeout(() => {
+      if (proc.exitCode === null && proc.signalCode === null) {
+        try { proc.kill('SIGKILL'); } catch {}
+      }
+    }, 1250);
+    timer.unref?.();
+    proc.once('exit', () => clearTimeout(timer));
   }
 
   _fit() {
@@ -332,8 +401,9 @@ class TerminalPane {
   }
 
   restart() {
-    try { this.proc?.kill('SIGKILL'); } catch {}
+    const oldProc = this.proc;
     this.proc = null;
+    this._terminateProcess(oldProc);
     this.term?.reset();
     this._setTitle('');
     this._spawn();
@@ -343,8 +413,9 @@ class TerminalPane {
     this.ro?.disconnect();
     this._dataSub?.dispose();
     this._resizeSub?.dispose();
-    try { this.proc?.kill('SIGKILL'); } catch {}
+    const oldProc = this.proc;
     this.proc = null;
+    this._terminateProcess(oldProc);
     this.term?.dispose();
     this.term = null;
   }
@@ -364,6 +435,7 @@ class MultiTerminalView extends ItemView {
     this._gutters             = [];
     this._dragSourceIdx       = null;
     this._fullscreenContainer = null;
+    this._activeResizeCleanup = null;
   }
 
   getViewType()    { return VIEW_TYPE; }
@@ -394,6 +466,7 @@ class MultiTerminalView extends ItemView {
   // ── Resize gutters ────────────────────────────────────────────
 
   _rebuildGutters(cols, rows) {
+    this._activeResizeCleanup?.();
     for (const g of this._gutters) g.remove();
     this._gutters = [];
 
@@ -403,7 +476,7 @@ class MultiTerminalView extends ItemView {
       g.style.gridRow    = '1 / -1';
       this._gutters.push(g);
       const ci = c;
-      g.addEventListener('mousedown', e => this._startResize(e, 'col', ci, cols, rows));
+      g.addEventListener('pointerdown', e => this._startResize(e, 'col', ci));
     }
 
     for (let r = 0; r < rows - 1; r++) {
@@ -412,12 +485,14 @@ class MultiTerminalView extends ItemView {
       g.style.gridColumn = '1 / -1';
       this._gutters.push(g);
       const ri = r;
-      g.addEventListener('mousedown', e => this._startResize(e, 'row', ri, cols, rows));
+      g.addEventListener('pointerdown', e => this._startResize(e, 'row', ri));
     }
   }
 
-  _startResize(e, axis, gutterIdx, cols, rows) {
+  _startResize(e, axis, gutterIdx) {
+    if (e.button !== 0) return;
     e.preventDefault();
+    this._activeResizeCleanup?.();
     const isCol    = axis === 'col';
     const frs      = [...(isCol ? this.colFrs : this.rowFrs)];
     const rect     = this.gridEl.getBoundingClientRect();
@@ -427,9 +502,10 @@ class MultiTerminalView extends ItemView {
     const startMouse = isCol ? e.clientX : e.clientY;
     const gEl = e.currentTarget;
     gEl.classList.add('mt-active');
+    gEl.setPointerCapture?.(e.pointerId);
 
-    // Coalesce the relayout/fit work to one pass per animation frame — mousemove
-    // can fire far faster than the screen refreshes, and each _fit() forces a
+    // Coalesce the relayout/fit work to one pass per animation frame — pointer
+    // events can fire far faster than the screen refreshes, and each _fit() forces a
     // measure/reflow across every pane.
     let rafId = null;
     const relayout = () => {
@@ -451,16 +527,25 @@ class MultiTerminalView extends ItemView {
       if (rafId === null) rafId = requestAnimationFrame(relayout);
     };
 
-    const onUp = () => {
+    const cleanup = () => {
       if (rafId !== null) { cancelAnimationFrame(rafId); rafId = null; }
-      relayout();   // settle on the final size
       gEl.classList.remove('mt-active');
-      document.removeEventListener('mousemove', onMove);
-      document.removeEventListener('mouseup', onUp);
+      gEl.removeEventListener('pointermove', onMove);
+      gEl.removeEventListener('pointerup', onUp);
+      gEl.removeEventListener('pointercancel', onUp);
+      try { gEl.releasePointerCapture?.(e.pointerId); } catch {}
+      this._activeResizeCleanup = null;
     };
 
-    document.addEventListener('mousemove', onMove);
-    document.addEventListener('mouseup', onUp);
+    const onUp = () => {
+      relayout();   // settle on the final size
+      cleanup();
+    };
+
+    this._activeResizeCleanup = cleanup;
+    gEl.addEventListener('pointermove', onMove);
+    gEl.addEventListener('pointerup', onUp);
+    gEl.addEventListener('pointercancel', onUp);
   }
 
   // ── Focus management ──────────────────────────────────────────
@@ -515,15 +600,20 @@ class MultiTerminalView extends ItemView {
       container.classList.remove('mt-fullscreen');
       this._fullscreenContainer = null;
       setIcon(fsBtn, 'maximize-2');
+      fsBtn.setAttribute('aria-pressed', 'false');
     } else {
       if (this._fullscreenContainer) {
         this._fullscreenContainer.classList.remove('mt-fullscreen');
         const prev = this._fullscreenContainer.querySelector('.mt-fs-btn');
-        if (prev) setIcon(prev, 'maximize-2');
+        if (prev) {
+          setIcon(prev, 'maximize-2');
+          prev.setAttribute('aria-pressed', 'false');
+        }
       }
       container.classList.add('mt-fullscreen');
       this._fullscreenContainer = container;
       setIcon(fsBtn, 'minimize-2');
+      fsBtn.setAttribute('aria-pressed', 'true');
       this._focusPaneAt(Number(container.dataset.paneIdx));
     }
     pane._fit();
@@ -562,6 +652,7 @@ class MultiTerminalView extends ItemView {
   }
 
   async onClose() {
+    this._activeResizeCleanup?.();
     for (const { pane } of this.paneList) pane.dispose();
     this.paneList = [];
   }
@@ -571,6 +662,7 @@ class MultiTerminalView extends ItemView {
   // ── Pane management ───────────────────────────────────────────
 
   async _applyCount(n) {
+    n = Math.max(1, Math.min(6, Math.trunc(Number(n) || DEFAULT_SETTINGS.count)));
     const cols     = this._numCols(n);
     const rows     = this._numRows(n);
     const prevN    = this.paneList.length;
@@ -608,15 +700,32 @@ class MultiTerminalView extends ItemView {
       setIcon(grip, 'grip-vertical');
       hdr.createEl('span', { cls: 'mt-pane-num', text: String(idx + 1) });
       const titleEl = hdr.createEl('span', { cls: 'mt-pane-title' });
-      const btn     = hdr.createEl('button', { cls: 'mt-icon-btn', title: 'Restart shell' });
+      const btn = hdr.createEl('button', {
+        cls: 'mt-icon-btn',
+        title: 'Restart shell',
+        attr: { type: 'button', 'aria-label': 'Restart shell' },
+      });
       setIcon(btn, 'refresh-cw');
-      const fsBtn   = hdr.createEl('button', { cls: 'mt-icon-btn mt-fs-btn', title: 'Toggle fullscreen' });
+      const fsBtn = hdr.createEl('button', {
+        cls: 'mt-icon-btn mt-fs-btn',
+        title: 'Toggle fullscreen',
+        attr: {
+          type: 'button',
+          'aria-label': 'Toggle terminal fullscreen',
+          'aria-pressed': 'false',
+        },
+      });
       setIcon(fsBtn, 'maximize-2');
 
       const xtermEl = container.createEl('div', { cls: 'mt-xterm' });
 
-      const pane = new TerminalPane(xtermEl, this.cwd, this.plugin, dir => this._moveFocus(dir));
-      pane.titleEl = titleEl;
+      const pane = new TerminalPane(
+        xtermEl,
+        titleEl,
+        this.cwd,
+        this.plugin,
+        dir => this._moveFocus(dir),
+      );
 
       btn.addEventListener('click', () => {
         this.paneList[Number(container.dataset.paneIdx)].pane.restart();
@@ -676,6 +785,8 @@ class MultiTerminalView extends ItemView {
     this._applyTemplate();
 
     if (this.focusedIdx >= this.paneList.length) this.focusedIdx = 0;
+    for (const { container } of this.paneList) container.classList.remove('mt-focused');
+    this.paneList[this.focusedIdx]?.container.classList.add('mt-focused');
   }
 }
 
@@ -723,7 +834,7 @@ class MultiTerminalSettingTab extends PluginSettingTab {
       .setName('Font size')
       .setDesc('Terminal font size in pixels. Updates live.')
       .addDropdown(d => {
-        for (const size of [8, 10, 11, 12, 13, 14, 16, 18, 20, 24]) {
+        for (const size of FONT_SIZES) {
           d.addOption(String(size), `${size}px`);
         }
         d.setValue(String(this.plugin.settings.fontSize))
@@ -742,13 +853,9 @@ class MultiTerminalSettingTab extends PluginSettingTab {
 
 class MultiTerminalPlugin extends Plugin {
   settings  = { ...DEFAULT_SETTINGS };
-  proxyPath = '';
 
   async onload() {
     await this.loadSettings();
-
-    this.proxyPath = join(tmpdir(), 'mt_pty_proxy.py');
-    writeFileSync(this.proxyPath, PTY_PROXY_PY, 'utf8');
 
     this.registerView(VIEW_TYPE, leaf => new MultiTerminalView(leaf, this));
     this.addSettingTab(new MultiTerminalSettingTab(this.app, this));
@@ -773,7 +880,7 @@ class MultiTerminalPlugin extends Plugin {
   }
 
   async loadSettings() {
-    this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    this.settings = normalizeSettings(await this.loadData());
   }
 
   async saveSettings() {

@@ -91,6 +91,8 @@ Each terminal pane spawns a Python process that calls `pty.fork()` to create a r
 
 This approach — Python PTY proxy over stdio — is the same technique used by [polyipseity/obsidian-terminal](https://github.com/polyipseity/obsidian-terminal) and requires no native Node.js compilation.
 
+The proxy is passed directly to Python rather than written to a shared temporary file. On restart, pane close, or plugin unload, it first terminates the shell and its foreground process group, then escalates only if they do not exit promptly.
+
 ---
 
 ## Limitations
@@ -101,6 +103,20 @@ This approach — Python PTY proxy over stdio — is the same technique used by 
   ```bash
   PROMPT_COMMAND='printf "\033]7;file://%s%s\007" "$HOSTNAME" "$PWD"'
   ```
+
+---
+
+## Development
+
+Install dependencies, then run the build and smoke tests:
+
+```bash
+npm install
+npm run build
+npm test
+```
+
+The smoke suite verifies fragmented resize messages, shell exit-code propagation, and cleanup of a running foreground process.
 
 ---
 

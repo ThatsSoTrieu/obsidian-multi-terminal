@@ -1,9 +1,9 @@
 {
   "id": "many-terminals",
   "name": "Many Terminals",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "minAppVersion": "1.4.11",
-  "description": "Open up to 6 terminals in one window in a resizable, reorderable grid. Linux and macOS only.",
+  "description": "Open up to 6 real terminals in one resizable Obsidian grid. Linux and macOS only.",
   "author": "ThatsSoTrieu",
   "authorUrl": "https://github.com/ThatsSoTrieu",
   "isDesktopOnly": true

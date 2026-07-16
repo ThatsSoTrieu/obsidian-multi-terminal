@@ -70,6 +70,7 @@
   transition: background 0.15s;
   z-index: 5;
   border-radius: 1px;
+  touch-action: none;
 }
 
 .mt-gutter-col { cursor: col-resize; }
@@ -189,6 +190,11 @@
   flex-shrink: 0;
 }
 .mt-icon-btn:hover { color: var(--text-normal); background: var(--background-modifier-hover); }
+.mt-icon-btn:focus-visible {
+  color: var(--text-normal);
+  outline: 2px solid var(--interactive-accent);
+  outline-offset: 1px;
+}
 .mt-icon-btn svg   { width: 11px; height: 11px; }
 
 /* ── xterm mount ─────────────────────────────────────────────── */
